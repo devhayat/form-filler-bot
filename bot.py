@@ -1,30 +1,26 @@
 """
 Google Form Auto-Filler Telegram Bot v2
 ========================================
+- Uses raw Telegram Bot API (no python-telegram-bot library)
+- Works on ANY Python version including 3.14
 - Scrapes any public Google Form
 - Auto-fills from saved user profile
 - Asks ALL unknown questions at once
 - Shows confirmation summary before submit
 - Handles file uploads via prefilled URL
-- Handles all field types: text, MC, dropdown, checkbox, date, time, scale, grid
 """
 
 import json
 import logging
 import os
 import re
+import threading
+import time
+import http.server
 
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
 
 load_dotenv()
 
@@ -34,6 +30,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+API_BASE = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 USER_INFO_FILE = "user_info.json"
 
 TYPE_SHORT_TEXT      = 0
@@ -88,6 +85,38 @@ KEYWORD_MAP = [
     (["website", "portfolio", "personal website", "portfolio link"], "website"),
 ]
 
+# ── In-memory state per chat_id ─────────────────────────────────────────────
+user_state = {}  # chat_id -> {"mode": str, "filled": {}, "unanswered": [], ...}
+
+
+# ── Telegram API helpers ─────────────────────────────────────────────────────
+
+def tg_send(chat_id, text, parse_mode="Markdown"):
+    """Send a message to a Telegram chat."""
+    try:
+        requests.post(f"{API_BASE}/sendMessage", json={
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": parse_mode,
+        }, timeout=10)
+    except Exception as e:
+        logger.error("sendMessage failed: %s", e)
+
+
+def tg_get_updates(offset=None):
+    """Long-poll for updates."""
+    params = {"timeout": 30, "allowed_updates": ["message"]}
+    if offset is not None:
+        params["offset"] = offset
+    try:
+        resp = requests.get(f"{API_BASE}/getUpdates", params=params, timeout=40)
+        return resp.json().get("result", [])
+    except Exception as e:
+        logger.error("getUpdates failed: %s", e)
+        return []
+
+
+# ── User profile helpers ─────────────────────────────────────────────────────
 
 def load_user_info() -> dict:
     if os.path.exists(USER_INFO_FILE):
@@ -119,6 +148,8 @@ def match_field(question: str):
                 return field
     return None
 
+
+# ── Google Forms helpers ─────────────────────────────────────────────────────
 
 def get_submit_url(url: str) -> str:
     url = url.strip().split("?")[0]
@@ -235,7 +266,7 @@ def submit_form(form_url: str, answers: dict) -> bool:
     payload = {}
     for k, v in answers.items():
         if isinstance(v, list):
-            payload[k] = v  # requests handles repeated keys for checkboxes
+            payload[k] = v
         else:
             payload[k] = v
     payload.update({"draftResponse": "[]", "pageHistory": "0"})
@@ -269,71 +300,7 @@ def build_confirmation_message(filled: dict, questions: list) -> str:
     return "\n".join(lines)
 
 
-async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    user_info = load_user_info()
-    has_info = any(user_info.get(k) for k in ["name", "email", "phone"])
-    await update.message.reply_text(
-        "👋 *Google Form Auto-Filler Bot*\n\n"
-        "Paste any Google Form link — I'll fill and submit it for you!\n\n"
-        f"{'✅ Your info is saved and ready!' if has_info else '⚠️ No info saved yet — use /setinfo first!'}\n\n"
-        "📋 *Commands:*\n"
-        "/setinfo — Save your personal details\n"
-        "/myinfo — View saved details\n"
-        "/help — Full usage guide\n\n"
-        "Paste a Google Form URL to begin! 🚀",
-        parse_mode="Markdown"
-    )
-
-
-async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🤖 *How it works:*\n\n"
-        "1️⃣ Use /setinfo to save your profile *once*\n"
-        "2️⃣ Paste any Google Form URL\n"
-        "3️⃣ I auto-fill everything I recognise\n"
-        "4️⃣ I show ALL remaining questions at once\n"
-        "5️⃣ Reply: `Q1: answer` / `Q2: 3` / `Q3: skip`\n"
-        "6️⃣ I show a full confirmation summary\n"
-        "7️⃣ Reply *yes* → submitted! ✅\n\n"
-        "📎 *File upload forms:* I send a pre-filled link.\n"
-        "You just upload the file and click Submit.\n\n"
-        "✅ Handles: text, MC, dropdown, checkboxes,\n"
-        "date, time, linear scale, grid fields.",
-        parse_mode="Markdown"
-    )
-
-
-async def setinfo_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    info = load_user_info()
-    preview_keys = ["name", "email", "phone", "address", "city", "state", "pincode",
-                    "college", "branch", "year", "roll_number", "company", "dob", "age", "gender"]
-    saved_lines = "\n".join(
-        f"  `{k}`: {info[k]}" for k in preview_keys if info.get(k)
-    ) or "  _(nothing saved yet)_"
-    await update.message.reply_text(
-        "📝 *Save your profile — send key: value pairs, one per line:*\n\n"
-        "`name: Rahul Sharma`\n`email: rahul@gmail.com`\n`phone: 9876543210`\n"
-        "`address: 12 MG Road, Andheri`\n`city: Mumbai`\n`state: Maharashtra`\n"
-        "`pincode: 400001`\n`college: VJTI Mumbai`\n`branch: Computer Engineering`\n"
-        "`year: 3rd Year`\n`roll_number: 2021CE045`\n`company: TCS`\n"
-        "`dob: 15/08/2002`\n`age: 22`\n`gender: Male`\n"
-        "`linkedin: linkedin.com/in/rahul`\n`github: github.com/rahul`\n\n"
-        "📌 *Currently saved:*\n" + saved_lines,
-        parse_mode="Markdown"
-    )
-    ctx.user_data["mode"] = "setinfo"
-
-
-async def myinfo_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    info = load_user_info()
-    if not info or not any(info.values()):
-        await update.message.reply_text("Nothing saved yet. Use /setinfo to add your details.")
-        return
-    lines = "\n".join(f"• *{k}*: {v}" for k, v in info.items() if v)
-    await update.message.reply_text(f"📋 *Your saved profile:*\n\n{lines}", parse_mode="Markdown")
-
-
-async def ask_all_at_once(update: Update, unanswered: list):
+def build_questions_message(unanswered: list) -> str:
     lines = ["📝 *Please answer these questions:*\n",
              "Reply with `Q1: answer`, `Q2: answer` format.\nType `skip` for optional ones.\n"]
     for i, q in enumerate(unanswered):
@@ -356,182 +323,225 @@ async def ask_all_at_once(update: Update, unanswered: list):
             lines.append("   _(Grid question — answer each row)_")
         lines.append("")
     lines.append("_Example:_\n`Q1: Computer Science`\n`Q2: 3`\n`Q3: 1, 2`\n`Q4: skip`")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    return "\n".join(lines)
 
 
-async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    mode = ctx.user_data.get("mode")
+# ── Message handlers ─────────────────────────────────────────────────────────
 
-    if mode == "setinfo":
-        info = load_user_info() or DEFAULT_INFO.copy()
-        updated = []
-        for line in text.split("\n"):
-            if ":" in line:
-                key, _, value = line.partition(":")
-                key = key.strip().lower().replace(" ", "_")
-                value = value.strip()
-                if key in DEFAULT_INFO:
-                    info[key] = value
-                    if key == "name" and " " in value:
-                        parts = value.split(" ", 1)
-                        info["first_name"] = parts[0]
-                        info["last_name"] = parts[1]
-                    updated.append(key)
-        if updated:
-            save_user_info(info)
-            await update.message.reply_text(
-                f"✅ *Saved:* {', '.join(updated)}\n\nNow paste a Google Form link!",
-                parse_mode="Markdown"
-            )
-        else:
-            await update.message.reply_text("❓ Use format: `name: Your Name`", parse_mode="Markdown")
-        ctx.user_data["mode"] = None
-        return
+def get_state(chat_id):
+    if chat_id not in user_state:
+        user_state[chat_id] = {"mode": None, "filled": {}, "unanswered": [],
+                                "all_questions": [], "form_url": "", "has_file_upload": False}
+    return user_state[chat_id]
 
-    if mode == "bulk_answering":
-        unanswered = ctx.user_data.get("unanswered", [])
-        filled = ctx.user_data.get("filled", {})
-        form_url = ctx.user_data.get("form_url", "")
-        has_file_upload = ctx.user_data.get("has_file_upload", False)
-        all_questions = ctx.user_data.get("all_questions", [])
 
-        answers_given = {}
-        for line in text.split("\n"):
-            line = line.strip()
-            if not line:
-                continue
-            m = re.match(r"^[Qq]?(\d+)[.:\)]\s*(.+)$", line)
-            if m:
-                answers_given[int(m.group(1)) - 1] = m.group(2).strip()
-        if not answers_given and len(unanswered) == 1:
-            answers_given[0] = text
-
-        skipped = []
-        for i, q in enumerate(unanswered):
-            if i not in answers_given:
-                continue
-            ans = answers_given[i]
-            if ans.lower() in ("skip", "-", "n/a", "none", ""):
-                skipped.append(q["title"])
-                continue
-            if q["type"] == TYPE_CHECKBOX and q["options"]:
-                selected = []
-                for part in re.split(r"[,;]", ans):
-                    part = part.strip()
-                    if part.isdigit():
-                        idx = int(part) - 1
-                        if 0 <= idx < len(q["options"]):
-                            selected.append(q["options"][idx])
-                    else:
-                        selected.append(part)
-                filled[q["field_id"]] = selected
-                continue
-            if q["type"] in (TYPE_MULTIPLE_CHOICE, TYPE_DROPDOWN) and q["options"] and ans.isdigit():
-                idx = int(ans) - 1
-                if 0 <= idx < len(q["options"]):
-                    ans = q["options"][idx]
-            filled[q["field_id"]] = ans
-
-        still_missing = [
-            (i, q) for i, q in enumerate(unanswered)
-            if q["required"] and q["field_id"] not in filled
-        ]
-        if still_missing:
-            missing_text = "\n".join(f"Q{i+1}: {q['title']}" for i, q in still_missing)
-            await update.message.reply_text(
-                f"⚠️ *Still missing required answers:*\n\n{missing_text}\n\nPlease answer them!",
-                parse_mode="Markdown"
-            )
-            ctx.user_data["unanswered"] = [q for _, q in still_missing]
-            ctx.user_data["filled"] = filled
-            await ask_all_at_once(update, ctx.user_data["unanswered"])
-            return
-
-        ctx.user_data["filled"] = filled
-        ctx.user_data["mode"] = "confirming"
-        await update.message.reply_text(
-            build_confirmation_message(filled, all_questions), parse_mode="Markdown"
-        )
-        return
-
-    if mode == "confirming":
-        filled = ctx.user_data.get("filled", {})
-        form_url = ctx.user_data.get("form_url", "")
-        has_file_upload = ctx.user_data.get("has_file_upload", False)
-
-        if text.lower() in ("yes", "y", "confirm", "submit", "ok", "haan", "ha"):
-            if has_file_upload:
-                prefilled = generate_prefilled_url(form_url, filled)
-                await update.message.reply_text(
-                    "⚠️ *This form has a file upload field.*\n"
-                    "Google Forms doesn't allow bots to upload files automatically.\n\n"
-                    "I've pre-filled all other fields for you.\n"
-                    "Just open this link, upload your file, and press Submit:\n\n"
-                    f"🔗 *Pre-filled Form Link:*\n{prefilled}\n\n"
-                    "You only need to: upload file → click Submit ✅",
-                    parse_mode="Markdown"
-                )
-            else:
-                await update.message.reply_text("⏳ Submitting your form...")
-                try:
-                    success = submit_form(form_url, filled)
-                    if success:
-                        await update.message.reply_text(
-                            f"✅ *Form submitted successfully!* 🎉\n\n"
-                            f"📊 *{len(filled)}* fields filled\n\nSend another form link anytime!",
-                            parse_mode="Markdown"
-                        )
-                    else:
-                        await update.message.reply_text(
-                            "⚠️ Submission may have failed.\n"
-                            "The form might require a Google login. Try opening it manually."
-                        )
-                except Exception as e:
-                    await update.message.reply_text(f"❌ Submit error: {e}")
-
-        elif text.lower() in ("no", "n", "cancel", "nahi", "nope"):
-            await update.message.reply_text(
-                "❌ *Cancelled.* No form was submitted.\n\nSend a form link again whenever you're ready.",
-                parse_mode="Markdown"
-            )
-        else:
-            await update.message.reply_text(
-                "Please reply *yes* to submit or *no* to cancel.", parse_mode="Markdown"
-            )
-            return
-        ctx.user_data["mode"] = None
-        return
-
-    if "docs.google.com/forms" in text:
-        await process_form(update, ctx, text)
-        return
-
-    await update.message.reply_text(
-        "Paste a Google Form link, or use /setinfo to update your profile.\n/help for guide."
+def handle_start(chat_id):
+    user_info = load_user_info()
+    has_info = any(user_info.get(k) for k in ["name", "email", "phone"])
+    tg_send(chat_id,
+        "👋 *Google Form Auto-Filler Bot*\n\n"
+        "Paste any Google Form link — I'll fill and submit it for you!\n\n"
+        f"{'✅ Your info is saved and ready!' if has_info else '⚠️ No info saved yet — use /setinfo first!'}\n\n"
+        "📋 *Commands:*\n"
+        "/setinfo — Save your personal details\n"
+        "/myinfo — View saved details\n"
+        "/help — Full usage guide\n\n"
+        "Paste a Google Form URL to begin! 🚀"
     )
 
 
-async def process_form(update: Update, ctx: ContextTypes.DEFAULT_TYPE, url: str):
-    await update.message.reply_text("🔍 Scanning form questions...")
+def handle_help(chat_id):
+    tg_send(chat_id,
+        "🤖 *How it works:*\n\n"
+        "1️⃣ Use /setinfo to save your profile *once*\n"
+        "2️⃣ Paste any Google Form URL\n"
+        "3️⃣ I auto-fill everything I recognise\n"
+        "4️⃣ I show ALL remaining questions at once\n"
+        "5️⃣ Reply: `Q1: answer` / `Q2: 3` / `Q3: skip`\n"
+        "6️⃣ I show a full confirmation summary\n"
+        "7️⃣ Reply *yes* → submitted! ✅\n\n"
+        "📎 *File upload forms:* I send a pre-filled link.\n"
+        "You just upload the file and click Submit.\n\n"
+        "✅ Handles: text, MC, dropdown, checkboxes,\n"
+        "date, time, linear scale, grid fields."
+    )
+
+
+def handle_setinfo(chat_id):
+    info = load_user_info()
+    preview_keys = ["name", "email", "phone", "address", "city", "state", "pincode",
+                    "college", "branch", "year", "roll_number", "company", "dob", "age", "gender"]
+    saved_lines = "\n".join(
+        f"  `{k}`: {info[k]}" for k in preview_keys if info.get(k)
+    ) or "  _(nothing saved yet)_"
+    tg_send(chat_id,
+        "📝 *Save your profile — send key: value pairs, one per line:*\n\n"
+        "`name: Rahul Sharma`\n`email: rahul@gmail.com`\n`phone: 9876543210`\n"
+        "`address: 12 MG Road, Andheri`\n`city: Mumbai`\n`state: Maharashtra`\n"
+        "`pincode: 400001`\n`college: VJTI Mumbai`\n`branch: Computer Engineering`\n"
+        "`year: 3rd Year`\n`roll_number: 2021CE045`\n`company: TCS`\n"
+        "`dob: 15/08/2002`\n`age: 22`\n`gender: Male`\n"
+        "`linkedin: linkedin.com/in/rahul`\n`github: github.com/rahul`\n\n"
+        "📌 *Currently saved:*\n" + saved_lines
+    )
+    get_state(chat_id)["mode"] = "setinfo"
+
+
+def handle_myinfo(chat_id):
+    info = load_user_info()
+    if not info or not any(info.values()):
+        tg_send(chat_id, "Nothing saved yet. Use /setinfo to add your details.")
+        return
+    lines = "\n".join(f"• *{k}*: {v}" for k, v in info.items() if v)
+    tg_send(chat_id, f"📋 *Your saved profile:*\n\n{lines}")
+
+
+def handle_setinfo_reply(chat_id, text):
+    state = get_state(chat_id)
+    info = load_user_info() or DEFAULT_INFO.copy()
+    updated = []
+    for line in text.split("\n"):
+        if ":" in line:
+            key, _, value = line.partition(":")
+            key = key.strip().lower().replace(" ", "_")
+            value = value.strip()
+            if key in DEFAULT_INFO:
+                info[key] = value
+                if key == "name" and " " in value:
+                    parts = value.split(" ", 1)
+                    info["first_name"] = parts[0]
+                    info["last_name"] = parts[1]
+                updated.append(key)
+    if updated:
+        save_user_info(info)
+        tg_send(chat_id, f"✅ *Saved:* {', '.join(updated)}\n\nNow paste a Google Form link!")
+    else:
+        tg_send(chat_id, "❓ Use format: `name: Your Name`")
+    state["mode"] = None
+
+
+def handle_bulk_answers(chat_id, text):
+    state = get_state(chat_id)
+    unanswered = state["unanswered"]
+    filled = state["filled"]
+    all_questions = state["all_questions"]
+
+    answers_given = {}
+    for line in text.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        m = re.match(r"^[Qq]?(\d+)[.:\)]\s*(.+)$", line)
+        if m:
+            answers_given[int(m.group(1)) - 1] = m.group(2).strip()
+    if not answers_given and len(unanswered) == 1:
+        answers_given[0] = text
+
+    for i, q in enumerate(unanswered):
+        if i not in answers_given:
+            continue
+        ans = answers_given[i]
+        if ans.lower() in ("skip", "-", "n/a", "none", ""):
+            continue
+        if q["type"] == TYPE_CHECKBOX and q["options"]:
+            selected = []
+            for part in re.split(r"[,;]", ans):
+                part = part.strip()
+                if part.isdigit():
+                    idx = int(part) - 1
+                    if 0 <= idx < len(q["options"]):
+                        selected.append(q["options"][idx])
+                else:
+                    selected.append(part)
+            filled[q["field_id"]] = selected
+            continue
+        if q["type"] in (TYPE_MULTIPLE_CHOICE, TYPE_DROPDOWN) and q["options"] and ans.isdigit():
+            idx = int(ans) - 1
+            if 0 <= idx < len(q["options"]):
+                ans = q["options"][idx]
+        filled[q["field_id"]] = ans
+
+    still_missing = [
+        (i, q) for i, q in enumerate(unanswered)
+        if q["required"] and q["field_id"] not in filled
+    ]
+    if still_missing:
+        missing_text = "\n".join(f"Q{i+1}: {q['title']}" for i, q in still_missing)
+        tg_send(chat_id,
+            f"⚠️ *Still missing required answers:*\n\n{missing_text}\n\nPlease answer them!")
+        state["unanswered"] = [q for _, q in still_missing]
+        state["filled"] = filled
+        tg_send(chat_id, build_questions_message(state["unanswered"]))
+        return
+
+    state["filled"] = filled
+    state["mode"] = "confirming"
+    tg_send(chat_id, build_confirmation_message(filled, all_questions))
+
+
+def handle_confirm(chat_id, text):
+    state = get_state(chat_id)
+    filled = state["filled"]
+    form_url = state["form_url"]
+    has_file_upload = state["has_file_upload"]
+
+    if text.lower() in ("yes", "y", "confirm", "submit", "ok", "haan", "ha"):
+        if has_file_upload:
+            prefilled = generate_prefilled_url(form_url, filled)
+            tg_send(chat_id,
+                "⚠️ *This form has a file upload field.*\n"
+                "Google Forms doesn't allow bots to upload files automatically.\n\n"
+                "I've pre-filled all other fields for you.\n"
+                "Just open this link, upload your file, and press Submit:\n\n"
+                f"🔗 *Pre-filled Form Link:*\n{prefilled}\n\n"
+                "You only need to: upload file → click Submit ✅"
+            )
+        else:
+            tg_send(chat_id, "⏳ Submitting your form...")
+            try:
+                success = submit_form(form_url, filled)
+                if success:
+                    tg_send(chat_id,
+                        f"✅ *Form submitted successfully!* 🎉\n\n"
+                        f"📊 *{len(filled)}* fields filled\n\nSend another form link anytime!")
+                else:
+                    tg_send(chat_id,
+                        "⚠️ Submission may have failed.\n"
+                        "The form might require a Google login. Try opening it manually.")
+            except Exception as e:
+                tg_send(chat_id, f"❌ Submit error: {e}")
+
+    elif text.lower() in ("no", "n", "cancel", "nahi", "nope"):
+        tg_send(chat_id,
+            "❌ *Cancelled.* No form was submitted.\n\nSend a form link again whenever you're ready.")
+    else:
+        tg_send(chat_id, "Please reply *yes* to submit or *no* to cancel.")
+        return
+
+    state["mode"] = None
+
+
+def process_form(chat_id, url):
+    tg_send(chat_id, "🔍 Scanning form questions...")
     try:
         questions = scrape_google_form(url)
     except Exception as e:
-        await update.message.reply_text(
+        tg_send(chat_id,
             f"❌ Could not read form: {e}\n\n"
             "• Make sure the form is *public* (test in incognito tab)\n"
-            "• Copy the URL directly from your browser address bar",
-            parse_mode="Markdown"
-        )
+            "• Copy the URL directly from your browser address bar")
         return
     if not questions:
-        await update.message.reply_text("❌ No fillable questions found.")
+        tg_send(chat_id, "❌ No fillable questions found.")
         return
 
     user_info = load_user_info()
     filled, unanswered, has_file_upload = auto_fill(questions, user_info)
 
-    total_fillable = len([q for q in questions if q["type"] not in SKIP_TYPES and q["type"] != TYPE_FILE_UPLOAD and q["field_id"]])
+    total_fillable = len([q for q in questions
+                          if q["type"] not in SKIP_TYPES
+                          and q["type"] != TYPE_FILE_UPLOAD
+                          and q["field_id"]])
     auto_titles = [q["title"] for q in questions if q.get("field_id") in filled]
     summary = ["📋 *Form Scan Complete:*\n",
                f"✅ *Auto-filled {len(filled)}/{total_fillable}:*"]
@@ -543,54 +553,113 @@ async def process_form(update: Update, ctx: ContextTypes.DEFAULT_TYPE, url: str)
         summary.append(f"\n❓ *{len(unanswered)} question(s) need your input*")
     else:
         summary.append("\n🎯 *All fields filled!*")
-    await update.message.reply_text("\n".join(summary), parse_mode="Markdown")
+    tg_send(chat_id, "\n".join(summary))
 
-    ctx.user_data["all_questions"] = questions
-    ctx.user_data["filled"] = filled
-    ctx.user_data["form_url"] = url
-    ctx.user_data["has_file_upload"] = has_file_upload
+    state = get_state(chat_id)
+    state["all_questions"] = questions
+    state["filled"] = filled
+    state["form_url"] = url
+    state["has_file_upload"] = has_file_upload
 
     if unanswered:
-        ctx.user_data["mode"] = "bulk_answering"
-        ctx.user_data["unanswered"] = unanswered
-        await ask_all_at_once(update, unanswered)
+        state["mode"] = "bulk_answering"
+        state["unanswered"] = unanswered
+        tg_send(chat_id, build_questions_message(unanswered))
     else:
-        ctx.user_data["mode"] = "confirming"
-        await update.message.reply_text(
-            build_confirmation_message(filled, questions), parse_mode="Markdown"
-        )
+        state["mode"] = "confirming"
+        tg_send(chat_id, build_confirmation_message(filled, questions))
 
+
+def handle_update(update):
+    """Route an incoming Telegram update to the right handler."""
+    msg = update.get("message")
+    if not msg:
+        return
+    chat_id = msg["chat"]["id"]
+    text = msg.get("text", "").strip()
+    if not text:
+        return
+
+    # Commands
+    if text.startswith("/start"):
+        handle_start(chat_id)
+        return
+    if text.startswith("/help"):
+        handle_help(chat_id)
+        return
+    if text.startswith("/setinfo"):
+        handle_setinfo(chat_id)
+        return
+    if text.startswith("/myinfo"):
+        handle_myinfo(chat_id)
+        return
+
+    state = get_state(chat_id)
+    mode = state.get("mode")
+
+    if mode == "setinfo":
+        handle_setinfo_reply(chat_id, text)
+        return
+
+    if mode == "bulk_answering":
+        handle_bulk_answers(chat_id, text)
+        return
+
+    if mode == "confirming":
+        handle_confirm(chat_id, text)
+        return
+
+    if "docs.google.com/forms" in text:
+        process_form(chat_id, text)
+        return
+
+    tg_send(chat_id,
+        "Paste a Google Form link, or use /setinfo to update your profile.\n/help for guide.")
+
+
+# ── Dummy HTTP server for Render ─────────────────────────────────────────────
+
+def start_dummy_server():
+    port = int(os.getenv("PORT", 8080))
+
+    class SilentHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"Bot is running!")
+
+        def log_message(self, *args):
+            pass  # silence request logs
+
+    server = http.server.HTTPServer(("0.0.0.0", port), SilentHandler)
+    print(f"🌐 HTTP server on port {port} (for Render health checks)")
+    server.serve_forever()
+
+
+# ── Main polling loop ────────────────────────────────────────────────────────
 
 def main():
-    import threading
-    import http.server
-
-    # Render requires a bound port — this dummy server satisfies that requirement
-    def _dummy_server():
-        port = int(os.getenv("PORT", 8080))
-        handler = http.server.BaseHTTPRequestHandler
-
-        # Silence the default request logs from the dummy server
-        handler.log_message = lambda *args: None
-
-        server = http.server.HTTPServer(("0.0.0.0", port), handler)
-        print(f"🌐 Dummy HTTP server listening on port {port} (for Render)")
-        server.serve_forever()
-
-    threading.Thread(target=_dummy_server, daemon=True).start()
-
-    print("🤖 Starting Google Form Filler Bot v2...")
     if TELEGRAM_TOKEN == "YOUR_BOT_TOKEN_HERE":
         print("\n❌ Set TELEGRAM_BOT_TOKEN in your .env file first!")
         return
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("setinfo", setinfo_cmd))
-    app.add_handler(CommandHandler("myinfo", myinfo_cmd))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    # Start dummy HTTP server in background (required by Render)
+    threading.Thread(target=start_dummy_server, daemon=True).start()
+
+    print("🤖 Google Form Filler Bot v2 starting...")
     print("✅ Bot running! Open Telegram and send /start")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+    offset = None
+    while True:
+        updates = tg_get_updates(offset)
+        for update in updates:
+            offset = update["update_id"] + 1
+            try:
+                handle_update(update)
+            except Exception as e:
+                logger.error("Error handling update %s: %s", update.get("update_id"), e)
+        if not updates:
+            time.sleep(1)
 
 
 if __name__ == "__main__":
