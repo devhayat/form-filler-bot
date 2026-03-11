@@ -119,15 +119,16 @@ def tg_get_updates(offset=None):
 # ── User profile helpers ─────────────────────────────────────────────────────
 
 def load_user_info() -> dict:
-    if os.path.exists(USER_INFO_FILE):
-        with open(USER_INFO_FILE) as f:
-            return json.load(f)
+    # Env var takes priority — always wins on Render where filesystem resets
     env_info = os.getenv("USER_INFO_JSON")
     if env_info:
         try:
             return json.loads(env_info)
         except json.JSONDecodeError:
             pass
+    if os.path.exists(USER_INFO_FILE):
+        with open(USER_INFO_FILE) as f:
+            return json.load(f)
     return {}
 
 
@@ -609,8 +610,18 @@ def handle_update(update):
         handle_confirm(chat_id, text)
         return
 
-    if "docs.google.com/forms" in text:
-        process_form(chat_id, text)
+    # Detect both full URLs and forms.gle short links
+    if "docs.google.com/forms" in text or "forms.gle/" in text:
+        url = text.strip()
+        # Resolve short forms.gle links to full URL
+        if "forms.gle/" in url and "docs.google.com" not in url:
+            try:
+                r = requests.head(url, allow_redirects=True, timeout=10)
+                url = r.url
+                logger.info("Resolved short URL to: %s", url)
+            except Exception as e:
+                logger.warning("Could not resolve short URL: %s", e)
+        process_form(chat_id, url)
         return
 
     tg_send(chat_id,
